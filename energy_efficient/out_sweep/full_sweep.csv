@@ -1,0 +1,1 @@
+time,n_hidden,nu_plus,nu_minus,inhib_strength,inh_decay,top_k,enable_inhibition_at_start,encoder,target_spikes,eta_up,eta_down,thresh_min,thresh_max,thresh_init,w_clip_min,w_clip_max,w_col_target_norm,w_init_lo,w_init_hi,wmin,wmax,N,log_every,seed,poisson_rate_scale,cfg_hash,error,spikes_per_sample,winners_unique,winner_HHI,energy_proxy_per_sample
