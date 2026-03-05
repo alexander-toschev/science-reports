@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from counts_readout import collect_counts_plus_cuda, make_mnist_datasets
+from counts_readout import collect_counts_plus_fast, make_mnist_datasets
 from readout_models import tfidf_from_counts, train_mlp_readout
 
 __all__ = ["probe_readouts_counts"]
@@ -164,8 +164,10 @@ def eval_readouts_from_net(
     затем гоняет probe_readouts_counts над counts и возвращает метрики.
     """
     ds_train, ds_test = make_mnist_datasets()
-    Xtr, ytr = collect_counts_plus_cuda(net, lif_layer, encoder, ds_train, n_train_counts, T=cfg.time, label_map=label_map)
-    Xte, yte = collect_counts_plus_cuda(net, lif_layer, encoder, ds_test,  n_test_counts,  T=cfg.time, label_map=label_map)
+    Xtr, ytr = collect_counts_plus_fast(net, lif_layer, encoder, ds_train, n_train_counts, T=cfg.time, label_map=label_map,  move_net=True, batch_size=128,
+        encoder_rate_boost=5.5)
+    Xte, yte = collect_counts_plus_fast(net, lif_layer, encoder, ds_test,  n_test_counts,  T=cfg.time, label_map=label_map,  move_net=True, batch_size=128,
+        encoder_rate_boost=5.5)
     N = lif_layer.n
     accs = probe_readouts_counts(Xtr, ytr, Xte, yte, n_hidden=N)
     return accs
