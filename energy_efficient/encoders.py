@@ -80,9 +80,11 @@ class LatencyEncoder:
     Single + batch universal. See module header for shapes.
     """
 
-    def __init__(self, time: int = 100, out_format: str = "auto"):
+    def __init__(self, time: int = 100, out_format: str = "auto", x_min: float = 0.0):
         self.time = int(time)
         self.out_format = out_format
+        # Порог тишины: пиксели ниже x_min не генерируют импульсов (чтобы фон не создавал залп на t=T-1)
+        self.x_min = float(x_min)
 
     @torch.no_grad()
     def __call__(self, image: Tensor) -> Tensor:
@@ -94,6 +96,7 @@ class LatencyEncoder:
         dev = x.device
 
         x_flat = x.reshape(B, -1)  # [B,784]
+        mask = x_flat >= self.x_min
         t_fire = torch.floor((1.0 - x_flat) * (T - 1)).to(torch.long)  # [B,784]
 
         spikes = torch.zeros((T, B, 784), dtype=torch.float32, device=dev)
@@ -101,7 +104,8 @@ class LatencyEncoder:
         b_idx = torch.arange(B, device=dev)[:, None].expand(B, 784)
         n_idx = torch.arange(784, device=dev)[None, :].expand(B, 784)
 
-        spikes[t_fire, b_idx, n_idx] = 1.0
+        # Ставим импульсы только там, где пиксель “значимый” (mask=True)
+        spikes[t_fire[mask], b_idx[mask], n_idx[mask]] = 1.0
         return _format_output(spikes, had_batch=had_batch, out_format=self.out_format)
 
 

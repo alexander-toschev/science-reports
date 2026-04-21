@@ -165,9 +165,9 @@ def eval_readouts_from_net(
     """
     ds_train, ds_test = make_mnist_datasets()
     Xtr, ytr = collect_counts_plus_fast(net, lif_layer, encoder, ds_train, n_train_counts, T=cfg.time, label_map=label_map,  move_net=True, batch_size=128,
-        encoder_rate_boost=5.5)
+        encoder_rate_boost=cfg.encoder_rate_boost)
     Xte, yte = collect_counts_plus_fast(net, lif_layer, encoder, ds_test,  n_test_counts,  T=cfg.time, label_map=label_map,  move_net=True, batch_size=128,
-        encoder_rate_boost=5.5)
+        encoder_rate_boost=cfg.encoder_rate_boost)
     N = lif_layer.n
     accs = probe_readouts_counts(Xtr, ytr, Xte, yte, n_hidden=N)
     return accs

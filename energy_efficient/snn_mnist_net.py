@@ -18,6 +18,7 @@ from bindsnet.network.monitors import Monitor
 from bindsnet.learning import PostPre
 from torchvision import transforms
 from encoders import LatencyEncoder, PoissonEncoder
+import datetime
 
 try:
     from torchvision import transforms as _tv_transforms
@@ -60,6 +61,7 @@ class Cfg:
     tau_val: float = 150.0
     refrac_val: float = 2.0
     reset_val: float = 0.0
+    rest_val: float = 0.0
     w_init_lo: float = 0.25
     w_init_hi: float = 0.8
     w_clip_min: float = 0.0
@@ -68,7 +70,8 @@ class Cfg:
     wmax: float = 1.0
     warmup_N: int = 10000
     top_k: int = 0
-
+    # --- encoders ---
+    latency_x_min: float = 0.05
     # --- сильная ингибиция (плотная матрица -α*(1-I)) ---
     strong_inh_matrix: bool = True
     strong_inh_value: float = 0.65   # α в формуле -α*(1-I)
@@ -80,6 +83,7 @@ class Cfg:
     # где у тебя описан Cfg (dataclass / pydantic / простая структура)
     encoder_out_format: str = "auto"   # "auto" | "TBN" | "TBN1"
     poisson_deterministic: bool = False
+    encoder_rate_boost: float = 3 # was 5.5
     def torch_device(self) -> torch.device:
         return torch.device(self.device)
 
@@ -111,6 +115,7 @@ def build_encoder_from_cfg(cfg: Cfg):
         return LatencyEncoder(
             time=cfg.time,
             out_format=out_fmt,
+            x_min=getattr(cfg, "latency_x_min", 0.0)
         )
 
     raise ValueError(f"Unknown encoder: {cfg.encoder}")
@@ -130,6 +135,9 @@ def tune_lif_params(lif: LIFNodes, n_hidden: int, cfg: Cfg) -> None:
         if hasattr(lif, "refrac"): lif.refrac = torch.tensor(cfg.refrac_val, device=lif.s.device)
         if hasattr(lif, "v_reset"): lif.v_reset = torch.tensor(cfg.reset_val, device=lif.s.device)
         elif hasattr(lif, "reset"): lif.reset = torch.tensor(cfg.reset_val, device=lif.s.device)
+        if hasattr(lif, "rest"): lif.rest = torch.tensor(cfg.rest_val, device=lif.s.device)
+        elif hasattr(lif, "v_rest"): lif.v_rest = torch.tensor(cfg.rest_val, device=lif.s.device)
+            
 
 def print_lif_params(lif: LIFNodes) -> None:
     def _stat(x):
@@ -145,6 +153,8 @@ def print_lif_params(lif: LIFNodes) -> None:
     dt = getattr(lif, "dt", None)
     print(f"[lif] thresh = {_stat(vt)}"); print(f"[lif] tc_decay = {_stat(tau)}")
     print(f"[lif] refrac = {_stat(refr)}"); print(f"[lif] reset = {_stat(reset)}")
+    rest = getattr(lif, "rest", getattr(lif, "v_rest", None))
+    print(f"[lif] rest  = {_stat(rest)}")
     if dt is not None: print(f"[lif] dt = {_stat(dt)}")
 
 def build_net(cfg: Cfg) -> Tuple[Network, Input, LIFNodes, Connection, Optional[Connection]]:
@@ -308,6 +318,7 @@ def _print_banner(cfg: Cfg) -> None:
     print(f"n_hidden={cfg.n_hidden}  thresh_init={cfg.thresh_init}")
     print(f"STDP: nu_plus={cfg.nu_plus}  nu_minus={cfg.nu_minus}")
     print(f"FF init: w∈[{cfg.w_init_lo}, {cfg.w_init_hi}], clip=[{cfg.w_clip_min},{cfg.w_clip_max}]")
+    print(f"LIF: rest_val={cfg.rest_val}  reset_val={cfg.reset_val}  tau={cfg.tau_val}  refrac={cfg.refrac_val}") 
     print(f"Encoder={cfg.encoder}  poisson_rate_scale={cfg.poisson_rate_scale}  base_seed={cfg.poisson_base_seed}")
     print(f"Inhibition: enable={cfg.enable_inhibition_at_start}  inhib_strength={cfg.inhib_strength}  top_k={cfg.top_k}")
     print("---------------------------\n")
@@ -341,7 +352,26 @@ def run_experiment(cfg: Cfg, verbose: bool = True, progress: bool = True):
         for wi in wbar:
             x = ds[wi]["image"].to(device)
             spikes = enc(x)
+            # --- DEBUG: проверить входные импульсы ---
+            if wi < 3:  # или i < 3 в train
+                print(f"[enc] shape={tuple(spikes.shape)} sum={float(spikes.sum())} max={float(spikes.max())}")
+                if spikes.ndim == 3:  # [T,1,784]
+                    per_t = spikes[:, 0, :].sum(dim=1)
+                elif spikes.ndim == 4:  # [T,1,1,784]
+                    per_t = spikes[:, 0, 0, :].sum(dim=1)
+                else:
+                    raise ValueError(f"Unexpected spikes ndim={spikes.ndim}")
+            
+                tmax = int(per_t.argmax().item())
+                print(f"[enc] per_t: min={float(per_t.min())} max={float(per_t.max())} t_argmax={tmax}")
             net.run(inputs={"Input": spikes}, time=cfg.time)
+            if wi < 3:  # или i < 3
+                in_s = mons["mon_X"].get("s")
+                lif_s = mons["mon_H"].get("s")
+                v = mons["mon_H"].get("v")
+                vt = getattr(lif_layer, "v_thresh", getattr(lif_layer, "thresh", None))
+            
+                print(f"[mon] in_sum={float(in_s.sum())} lif_sum={float(lif_s.sum())} v_max={float(v.max())} vt_min={float(vt.min()) if vt is not None else None}")
     
             # --- гомеостатика порогов на прогреве ---
             lif_s = mons["mon_H"].get("s")                         # [T,1,N]
@@ -353,8 +383,8 @@ def run_experiment(cfg: Cfg, verbose: bool = True, progress: bool = True):
                 w = connection.w
                 w.clamp_(cfg.w_clip_min, cfg.w_clip_max)
                 # простая L1-колонночная нормализация (если хочешь):
-                col = w.abs().sum(dim=0, keepdim=True).clamp_min(1e-6)
-                w.mul_(1.0 / col).clamp_(cfg.w_clip_min, cfg.w_clip_max)
+                #col = w.abs().sum(dim=0, keepdim=True).clamp_min(1e-6)
+                #w.mul_(1.0 / col).clamp_(cfg.w_clip_min, cfg.w_clip_max)
     
             # сброс между сэмплами
             net.reset_state_variables()
@@ -365,6 +395,9 @@ def run_experiment(cfg: Cfg, verbose: bool = True, progress: bool = True):
             if progress:
                 rate = (sc / max(1, cfg.time)).mean().item()
                 wbar.set_postfix_str(f"avg_rate={rate:.3f} target={cfg.target_spikes:.2f}")
+            if wi < 3:
+                w = connection.w
+                print(f"[W] mean={float(w.mean()):.6f} max={float(w.max()):.6f} min={float(w.min()):.6f}")
 
                 
     _set_stdp_nu(connection, cfg.nu_plus, cfg.nu_minus)
@@ -372,12 +405,26 @@ def run_experiment(cfg: Cfg, verbose: bool = True, progress: bool = True):
                    ncols=100, disable=not progress)
     for i in pbar:
         x = ds[i]["image"].to(device); spikes = enc(x)
+        # --- DEBUG: проверить входные импульсы ---
+        if i < 3:  # или i < 3 в train
+            print(f"[enc] shape={tuple(spikes.shape)} sum={float(spikes.sum())} max={float(spikes.max())}")
+            if spikes.ndim == 3:  # [T,1,784]
+                per_t = spikes[:, 0, :].sum(dim=1)
+            elif spikes.ndim == 4:  # [T,1,1,784]
+                per_t = spikes[:, 0, 0, :].sum(dim=1)
+            else:
+                raise ValueError(f"Unexpected spikes ndim={spikes.ndim}")
+        
+            tmax = int(per_t.argmax().item())
+            print(f"[enc] per_t: min={float(per_t.min())} max={float(per_t.max())} t_argmax={tmax}")
         net.run(inputs={"Input": spikes}, time=cfg.time)
         lif_s = mons["mon_H"].get("s"); in_s = mons["mon_X"].get("s")
         winners = []
         if cfg.top_k and cfg.top_k > 0:
-            ok, idxs = apply_wta(lif_layer.s, top_k=cfg.top_k)
-            if ok and idxs is not None: winners = idxs
+            # ВАЖНО: WTA надо считать по спайкам за всё время (lif_s из монитора), а не по lif_layer.s последнего шага.
+            ok, idxs = apply_wta(lif_s, top_k=cfg.top_k)
+            if ok and idxs is not None:
+                winners = idxs
         sc = (lif_s[:,0,:] if lif_s.ndim==3 else lif_s).sum(dim=0).float()
         ema.step(lif_layer, sc, cfg.time, cfg)
         with torch.no_grad(): connection.w.clamp_(cfg.w_clip_min, cfg.w_clip_max)
@@ -389,6 +436,9 @@ def run_experiment(cfg: Cfg, verbose: bool = True, progress: bool = True):
             report_string = f"[{i+1:5d}/{n_train}] spikes/sample={rpt_mid['spikes_per_sample']:.2f} uniq={rpt_mid['winners_unique']} HHI={rpt_mid['winner_HHI']:.3f} energy≈{rpt_mid['energy_proxy_per_sample']:.1f}"
             if (not progress):
                 print(report_string)
+        if i < 3:
+                w = connection.w
+                print(f"[W] mean={float(w.mean()):.6f} max={float(w.max()):.6f} min={float(w.min()):.6f}")
         if (verbose and progress):
             rpt_mid = meter.report()
             report_string = (
@@ -404,11 +454,102 @@ def run_experiment(cfg: Cfg, verbose: bool = True, progress: bool = True):
     out = {**asdict(cfg), **rpt}
     return out, connection, lif_layer, net, enc
 
-def save_snn(path: str, cfg: Cfg, connection: Connection, lif_layer: LIFNodes) -> None:
+#def save_snn(path: str, cfg: Cfg, connection: Connection, lif_layer: LIFNodes) -> None:
+#    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+#    vt = (lif_layer.v_thresh if hasattr(lif_layer, "v_thresh") else lif_layer.thresh)
+#    ckpt = {"cfg": asdict(cfg), "W": connection.w.detach().cpu(), "v_thresh": vt.detach().cpu()}
+#    torch.save(ckpt, path); print(f"Saved to {path} | W {tuple(ckpt['W'].shape)}")
+
+def save_snn(
+    path: str,
+    cfg: Cfg,
+    connection: Connection,
+    lif_layer: LIFNodes,
+    train_summary: Optional[Dict] = None,
+    eval_summary: Optional[Dict] = None,
+    notes: Optional[Dict] = None,
+) -> None:
+    """
+    Сохраняет чекпойнт сети + (опционально) сводки обучения/оценки.
+
+    Ключи в .pt:
+      - cfg: asdict(cfg)
+      - W: веса FF (Input->LIF)
+      - v_thresh: пороги LIF (вектор)
+      - train_summary: словарь с итогами обучения (то, что возвращает run_experiment)
+      - eval_summary: словарь с итогами оценки (например, probe_readouts_counts)
+      - notes: произвольные метаданные
+    """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    vt = (lif_layer.v_thresh if hasattr(lif_layer, "v_thresh") else lif_layer.thresh)
-    ckpt = {"cfg": asdict(cfg), "W": connection.w.detach().cpu(), "v_thresh": vt.detach().cpu()}
-    torch.save(ckpt, path); print(f"Saved to {path} | W {tuple(ckpt['W'].shape)}")
+
+    # пороги (в разных версиях слоя поле может называться по-разному)
+    vt = lif_layer.v_thresh if hasattr(lif_layer, "v_thresh") else lif_layer.thresh
+
+    W = connection.w.detach().cpu()
+    vt_cpu = vt.detach().cpu()
+
+    # полезные статистики для диагностики
+    weight_stats = {
+        "W_shape": tuple(W.shape),
+        "W_min": float(W.min().item()) if W.numel() else None,
+        "W_max": float(W.max().item()) if W.numel() else None,
+        "v_thresh_shape": tuple(vt_cpu.shape),
+        "v_thresh_min": float(vt_cpu.min().item()) if vt_cpu.numel() else None,
+        "v_thresh_max": float(vt_cpu.max().item()) if vt_cpu.numel() else None,
+    }
+
+    ckpt = {
+        "schema_version": 2,
+        "saved_at_utc": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "cfg": asdict(cfg),
+        "W": W,
+        "v_thresh": vt_cpu,
+        "weight_stats": weight_stats,
+    }
+
+    if train_summary is not None:
+        ckpt["train_summary"] = train_summary
+    if eval_summary is not None:
+        ckpt["eval_summary"] = eval_summary
+    if notes is not None:
+        ckpt["notes"] = notes
+
+    torch.save(ckpt, path)
+    print(f"Saved to {path} | W {tuple(W.shape)} | v_thresh {tuple(vt_cpu.shape)}")
+
+
+def update_snn_ckpt(path: str, **fields) -> None:
+    """
+    Обновляет существующий .pt, добавляя/перезаписывая поля.
+    Пример: update_snn_ckpt("out/snn_poisson.pt", eval_summary={"TFIDF+MLP": 0.5467})
+    """
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError("Чекпойнт должен быть dict")
+
+    payload.setdefault("schema_version", 2)
+    payload["updated_at_utc"] = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    for k, v in fields.items():
+        payload[k] = v
+
+    torch.save(payload, path)
+    print(f"Updated ckpt: {path} (fields: {list(fields.keys())})")
+
+
+def load_snn_summaries(path: str) -> Dict[str, Optional[Dict]]:
+    """
+    Читает train_summary / eval_summary / notes из чекпойнта (если есть).
+    """
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        return {"train_summary": None, "eval_summary": None, "notes": None}
+
+    return {
+        "train_summary": payload.get("train_summary"),
+        "eval_summary": payload.get("eval_summary"),
+        "notes": payload.get("notes"),
+    }
 
 def load_weights_into(net: Network, connection: Connection, lif_layer: LIFNodes, ckpt_path: str) -> None:
     ckpt = torch.load(ckpt_path, map_location="cpu")
